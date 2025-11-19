@@ -1,0 +1,10 @@
+.DS_Store
+cursor_output.log
+cursor_review_output.log
+cursor_review_output.md
+cursor_review_prompt.md
+lab_creation.md
+.cursor/
+.env
+.env.local
+.dockerignore

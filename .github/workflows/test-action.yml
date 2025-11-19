@@ -1,0 +1,261 @@
+name: Test Workflow
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+      - name: Run test command
+        run: echo "Test workflow for ${{ github.event.repository.name }}"
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_ORGA }}
+          password: ${{ secrets.DOCKER_OAT_FULL }}
+      - name: Publish Docker Compose services
+        uses: florianamette/Docker-Compose-Publishing-Tag-By-Services@V1.0.1
+        with:
+          docker_hub_username: ${{ secrets.DOCKER_ORGA }}
+          docker_hub_org_token: ${{ secrets.DOCKER_OAT_FULL }}
+          docker_compose_files: 'docker-compose.yml'
+      
+      - name: Get GitHub App Installation Token
+        id: github-app-token
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          GITHUB_ORG: ${{ secrets.GITHUB_ORG || 'CyberCTF' }}
+        run: |
+          echo "🔐 Génération du token GitHub App..."
+          if [ -z "$APP_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "❌ APP_ID ou APP_PRIVATE_KEY non défini"
+            exit 1
+          fi
+          # Masquer la clé privée dans les logs
+          echo "::add-mask::$APP_PRIVATE_KEY"
+          # Créer un fichier temporaire pour la clé privée
+          TEMP_KEY_FILE=$(mktemp)
+          echo "$APP_PRIVATE_KEY" > "$TEMP_KEY_FILE"
+          chmod 600 "$TEMP_KEY_FILE"
+          # Vérifier qu'openssl est disponible
+          if ! command -v openssl &> /dev/null; then
+            echo "❌ openssl est requis"
+            rm -f "$TEMP_KEY_FILE"
+            exit 1
+          fi
+          # Générer le JWT token
+          NOW=$(date +%s)
+          EXP=$((NOW + 600))
+          HEADER=$(echo -n '{"alg":"RS256","typ":"JWT"}' | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+          PAYLOAD=$(echo -n "{\"iat\":$NOW,\"exp\":$EXP,\"iss\":\"$APP_ID\"}" | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+          SIGNATURE=$(printf '%s' "$HEADER.$PAYLOAD" | openssl dgst -sha256 -sign "$TEMP_KEY_FILE" -binary | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+          JWT_TOKEN="$HEADER.$PAYLOAD.$SIGNATURE"
+          if [ -z "$JWT_TOKEN" ]; then
+            echo "❌ Échec de la génération du JWT token"
+            rm -f "$TEMP_KEY_FILE"
+            exit 1
+          fi
+          # Récupérer l'installation_id pour l'organisation
+          INSTALLATIONS_RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer $JWT_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/app/installations")
+          INSTALLATION_ID=$(echo "$INSTALLATIONS_RESPONSE" | jq -r ".[] | select(.account.login == \"$GITHUB_ORG\") | .id" | head -n 1)
+          if [ -z "$INSTALLATION_ID" ] || [ "$INSTALLATION_ID" = "null" ]; then
+            echo "❌ GitHub App n'est pas installé sur l'organisation: $GITHUB_ORG"
+            rm -f "$TEMP_KEY_FILE"
+            exit 1
+          fi
+          echo "✅ Installation ID trouvé: $INSTALLATION_ID"
+          # Récupérer le token d'installation
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $JWT_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens")
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.token // empty' 2>/dev/null)
+          rm -f "$TEMP_KEY_FILE"
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "❌ Échec de la récupération du token d'installation"
+            exit 1
+          fi
+          # Masquer le token dans les logs
+          echo "::add-mask::$ACCESS_TOKEN"
+          # Sauvegarder le token dans une variable d'environnement pour l'étape suivante
+          echo "GITHUB_APP_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+          echo "✅ Token GitHub App obtenu avec succès"
+      - name: Update docker-compose.yml with published images
+        env:
+          DOCKERHUB_ORG: ${{ secrets.DOCKER_ORGA }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "🔄 Mise à jour du docker-compose.yml avec les images publiées..."
+          if [ ! -f "docker-compose.yml" ]; then
+            echo "❌ docker-compose.yml introuvable"
+            exit 1
+          fi
+          # Installer yq si nécessaire
+          if ! command -v yq &> /dev/null; then
+            echo "📦 Installation de yq..."
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+          # Créer une copie de sauvegarde
+          cp docker-compose.yml docker-compose.yml.backup
+          # Obtenir la liste des services qui ont une section build
+          SERVICES=$(yq eval '.services | keys | .[]' docker-compose.yml)
+          UPDATED=false
+          for service in $SERVICES; do
+            # Vérifier si le service a une section build
+            HAS_BUILD=$(yq eval ".services.$service | has(\"build\")" docker-compose.yml)
+            if [ "$HAS_BUILD" != "true" ]; then
+              continue
+            fi
+            # Construire le nom de l'image : dockerhub_org/repo_name:service_name
+            # L'action Docker Compose Publishing publie avec le tag du service (web, database, etc.)
+            IMAGE_NAME="${DOCKERHUB_ORG}/${REPO_NAME}:${service}"
+            echo "📝 Mise à jour du service '$service' avec l'image: $IMAGE_NAME"
+            # Supprimer la section build et ajouter la section image
+            yq eval ".services.$service = (.services.$service | del(.build) | .image = \"$IMAGE_NAME\")" -i docker-compose.yml
+            UPDATED=true
+          done
+          if [ "$UPDATED" = true ]; then
+            echo "✅ docker-compose.yml mis à jour avec succès"
+            # Afficher les changements
+            echo "📋 Différences:"
+            diff -u docker-compose.yml.backup docker-compose.yml || true
+            # Configurer git pour le commit
+            git config user.name "CyberGen Bot"
+            git config user.email "cybergen-bot@users.noreply.github.com"
+            # Ajouter et committer les changements
+            git add docker-compose.yml
+            if git diff --staged --quiet; then
+              echo "ℹ️  Aucun changement à committer"
+            else
+              git commit -m "chore: update docker-compose.yml to use published Docker images" || true
+              # Push avec le token GitHub App
+              if [ -n "$GITHUB_APP_TOKEN" ]; then
+                git remote set-url origin https://x-access-token:${GITHUB_APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+              fi
+              git push origin main || echo "⚠️  Échec du push, mais le workflow continue"
+            fi
+            rm -f docker-compose.yml.backup
+          else
+            echo "ℹ️  Aucun service avec build: trouvé, docker-compose.yml inchangé"
+            rm -f docker-compose.yml.backup
+          fi
+          
+      - name: Get Auth0 M2M Token
+        env:
+          AUTH0_AUDIENCE: ${{ secrets.AUTH0_AUDIENCE }}
+          AUTH0_GRANT_TYPE: ${{ secrets.AUTH0_GRANT_TYPE }}
+          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
+        run: |
+          echo "🔐 Obtention du token M2M depuis Auth0..."
+          if [ -z "$AUTH0_AUDIENCE" ] || [ -z "$AUTH0_GRANT_TYPE" ] || [ -z "$AUTH0_CLIENT_ID" ] || [ -z "$AUTH0_CLIENT_SECRET" ]; then
+            echo "❌ Les secrets Auth0 ne sont pas tous définis"
+            exit 1
+          fi
+          # Masquer les secrets dans les logs
+          echo "::add-mask::$AUTH0_CLIENT_SECRET"
+          # Obtenir le token M2M depuis Auth0
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            "https://cybercourses.eu.auth0.com/oauth/token" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"audience\": \"$AUTH0_AUDIENCE\",
+              \"grant_type\": \"$AUTH0_GRANT_TYPE\",
+              \"client_id\": \"$AUTH0_CLIENT_ID\",
+              \"client_secret\": \"$AUTH0_CLIENT_SECRET\"
+            }")
+          echo "📋 Réponse Auth0:"
+          echo "$TOKEN_RESPONSE" | jq '.' || echo "$TOKEN_RESPONSE"
+          # Extraire le token d'accès
+          M2M_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+          if [ -z "$M2M_TOKEN" ] || [ "$M2M_TOKEN" = "null" ]; then
+            echo "❌ Impossible d'obtenir le token M2M"
+            exit 1
+          fi
+          # Masquer le token dans les logs
+          echo "::add-mask::$M2M_TOKEN"
+          # Sauvegarder le token dans une variable d'environnement pour l'étape suivante
+          echo "M2M_TOKEN=$M2M_TOKEN" >> $GITHUB_ENV
+          echo "✅ Token M2M obtenu avec succès"
+      - name: Upsert Challenge with Lab via GraphQL
+        env:
+          M2M_TOKEN: ${{ env.M2M_TOKEN }}
+          METADATA_SLUG: boolean-based-blind-sql-injection
+          METADATA_TITLE: "Boolean-based Blind SQL Injection"
+          METADATA_CATEGORY: web
+          METADATA_DIFFICULTY: 1
+          METADATA_POINTS: 100
+          METADATA_FLAG_FORMAT: user:password}
+          METADATA_FLAG: "The flag is the **administrative database user credentials** stored in the `app_repo41` database: username `backup8320` and password `kxj#t=%YkFv8S+q&`."
+          METADATA_QUESTION: "State the admin login in the form user:password."
+          METADATA_DESCRIPTION: "Boolean-based Blind SQL Injection is a technique used in the field of offensive cybersecurity to exploit vulnerabilities in applications using MariaDB (or similar databases), enabling unauthorized data extraction. This method leverages the application's responses to specially crafted SQL queries that result in true or false conditions, even when direct database responses are not visible to the attacker. Mastery of SQL query structure, Boolean logic, conditional statements, and prior knowledge of MariaDB Blind SQL Injection techniques are assumed for effective execution of this attack. Boolean-based Blind SQL Injection is a technique used in the field of offensive cybersecurity to exploit vulnerabilities in applications using MariaDB (or similar databases), enabling unauthorized data extraction. This method leverages the application's responses to specially crafted SQL queries that result in true or false conditions, even when direct database responses are not visible to the attacker. Mastery of SQL query structure, Boolean logic, conditional statements, and prior knowledge of MariaDB Blind SQL Injection techniques are assumed for effective execution of this attack."
+        run: |
+          echo "📡 Upsert d'un challenge avec lab via GraphQL..."
+          if [ -z "$M2M_TOKEN" ]; then
+            echo "❌ M2M_TOKEN n'est pas défini"
+            exit 1
+          fi
+          # Masquer le token dans les logs
+          echo "::add-mask::$M2M_TOKEN"
+          # Construire le labImageRef à partir de l'image publiée
+          DOCKERHUB_ORG=${{ secrets.DOCKER_ORGA }}
+          REPO_NAME=${{ github.event.repository.name }}
+          LAB_IMAGE_REF="${DOCKERHUB_ORG}/${REPO_NAME}"
+          echo "📦 Lab Image Ref: $LAB_IMAGE_REF"
+          # Construire le JSON de manière sûre avec jq en utilisant les variables d'environnement
+          GRAPHQL_QUERY="mutation UpsertChallengeWithLab(\$slug: String!, \$title: String!, \$category: ChallengeCategory!, \$difficulty: Int!, \$points: Int!, \$flagFormat: String!, \$flag: String, \$question: String, \$state: ChallengeState!, \$description: String, \$labRuntime: String!, \$labImageRef: String!, \$labTimeoutSeconds: Int!) { upsertChallengeWithLab(slug: \$slug, title: \$title, category: \$category, difficulty: \$difficulty, points: \$points, flagFormat: \$flagFormat, flag: \$flag, question: \$question, state: \$state, description: \$description, labRuntime: \$labRuntime, labImageRef: \$labImageRef, labTimeoutSeconds: \$labTimeoutSeconds) { uuid slug title category difficulty points state description createdAt updatedAt lab { uuid runtime imageRef timeoutSeconds } } }"
+          GRAPHQL_VARIABLES=$(jq -n \
+            --arg slug "$METADATA_SLUG" \
+            --arg title "$METADATA_TITLE" \
+            --arg category "$METADATA_CATEGORY" \
+            --argjson difficulty "$METADATA_DIFFICULTY" \
+            --argjson points "$METADATA_POINTS" \
+            --arg flagFormat "$METADATA_FLAG_FORMAT" \
+            --arg flag "$METADATA_FLAG" \
+            --arg question "$METADATA_QUESTION" \
+            --arg state "draft" \
+            --arg description "$METADATA_DESCRIPTION" \
+            --arg labRuntime "docker" \
+            --arg labImageRef "$LAB_IMAGE_REF" \
+            --argjson labTimeoutSeconds 3600 \
+            '{
+              slug: $slug,
+              title: $title,
+              category: $category,
+              difficulty: $difficulty,
+              points: $points,
+              flagFormat: $flagFormat,
+              flag: $flag,
+              question: $question,
+              state: $state,
+              description: $description,
+              labRuntime: $labRuntime,
+              labImageRef: $labImageRef,
+              labTimeoutSeconds: $labTimeoutSeconds
+            }')
+          GRAPHQL_PAYLOAD=$(jq -n \
+            --arg query "$GRAPHQL_QUERY" \
+            --argjson variables "$GRAPHQL_VARIABLES" \
+            '{query: $query, variables: $variables}')
+          # Mutation GraphQL pour upsert un challenge avec lab
+          API_RESPONSE=$(curl -s -X POST \
+            "https://back.cybercourses.fr/graphql" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $M2M_TOKEN" \
+            -d "$GRAPHQL_PAYLOAD")
+          echo "✅ Réponse de l'API GraphQL:"
+          echo "$API_RESPONSE" | jq '.' || echo "$API_RESPONSE"
+      

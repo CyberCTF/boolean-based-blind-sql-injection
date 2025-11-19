@@ -1,0 +1,12 @@
+{
+  "project_name": "cyberlabs-boolean-based-blind-sql-injection",
+  "slug": "boolean-based-blind-sql-injection",
+  "title": "Boolean-based Blind SQL Injection",
+  "description": "Boolean-based Blind SQL Injection is a technique used in the field of offensive cybersecurity to exploit vulnerabilities in applications using MariaDB (or similar databases), enabling unauthorized data extraction. This method leverages the application's responses to specially crafted SQL queries that result in true or false conditions, even when direct database responses are not visible to the attacker. Mastery of SQL query structure, Boolean logic, conditional statements, and prior knowledge of MariaDB Blind SQL Injection techniques are assumed for effective execution of this attack. Boolean-based Blind SQL Injection is a technique used in the field of offensive cybersecurity to exploit vulnerabilities in applications using MariaDB (or similar databases), enabling unauthorized data extraction. This method leverages the application's responses to specially crafted SQL queries that result in true or false conditions, even when direct database responses are not visible to the attacker. Mastery of SQL query structure, Boolean logic, conditional statements, and prior knowledge of MariaDB Blind SQL Injection techniques are assumed for effective execution of this attack.",
+  "category": "web",
+  "difficulty": 1,
+  "flag": "The flag is the **administrative database user credentials** stored in the `app_repo41` database: username `backup8320` and password `kxj#t=%YkFv8S+q&`.",
+  "flag_format": "user:password",
+  "points": 100,
+  "question": "State the admin login in the form user:password."
+}
