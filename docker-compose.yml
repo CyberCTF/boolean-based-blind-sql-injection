@@ -1,9 +1,6 @@
 services:
   web:
-    build:
-      context: ./build/web
-      dockerfile: Dockerfile
-    image: boolean-blind-sql-injection_web
+    image: cyberctf/boolean-based-blind-sql-injection:web
     ports:
       - "${WEB_PORT:-3206}:3206"
     environment:
@@ -22,12 +19,8 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-
   database:
-    build:
-      context: ./build/database
-      dockerfile: Dockerfile
-    image: boolean-blind-sql-injection_database
+    image: cyberctf/boolean-based-blind-sql-injection:database
     ports:
       - "${DB_HOST_PORT:-3207}:3207"
     environment:
